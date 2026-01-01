@@ -16,7 +16,7 @@ STATIC_FILL = -9999
 
 
 # ----------------------------
-# Date helpers (fixed 181, drop Feb29)
+# Date helpers (fixed 181, drop Feb29)评价原始数据
 # ----------------------------
 def winter_dates(start_year: int) -> List[str]:
     d0 = date(start_year, 11, 1)
@@ -684,7 +684,9 @@ def weighted_merge(rows: List[Dict], keys: List[str], weight_key: str) -> Dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--root", required=True, help="Path like data/raw_data/QinghaiTibet"
+        "--root",
+        default=None,
+        help="Path like data/raw_data/Tibet (default: auto-detect under repo data/raw_data).",
     )
     ap.add_argument(
         "--only", default=None, help="Substring filter for group_id / filename"
@@ -692,19 +694,35 @@ def main():
     ap.add_argument(
         "--fast", action="store_true", help="Fast smoke test (3 days, limited windows)"
     )
+    ap.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory (default: tools/qc_out).",
+    )
     args = ap.parse_args()
 
     root = args.root
     only = args.only
     fast = args.fast
 
-    root_path = os.path.normpath(root)
-    if not os.path.exists(root_path):
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        candidate = os.path.normpath(os.path.join(repo_root, root_path))
-        if os.path.exists(candidate):
-            root_path = candidate
-            root = candidate
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+
+    if root is None:
+        candidates = [
+            os.path.join(repo_root, "data", "raw_data", "Tibet"),
+            os.path.join(repo_root, "data", "raw_data", "QinghaiTibet"),
+            os.path.join(repo_root, "data", "raw_data"),
+        ]
+        root_path = next((p for p in candidates if os.path.exists(p)), candidates[0])
+        root = root_path
+    else:
+        root_path = os.path.normpath(root)
+        if not os.path.exists(root_path):
+            candidate = os.path.normpath(os.path.join(repo_root, root_path))
+            if os.path.exists(candidate):
+                root_path = candidate
+                root = candidate
 
     tifs = []
     for dp, _, files in os.walk(root_path):
@@ -808,10 +826,17 @@ def main():
             print("-" * 88)
 
     # write tile csv
-    os.makedirs("qc_out", exist_ok=True)
-    tiles_csv = os.path.join("qc_out", "qc_tiles.csv")
-    groups_csv = os.path.join("qc_out", "qc_groups.csv")
-    report_txt = os.path.join("qc_out", "qc_report.txt")
+    out_dir = args.out_dir
+    if out_dir is None:
+        out_dir = os.path.join(script_dir, "qc_out")
+    else:
+        out_dir = os.path.normpath(out_dir)
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.normpath(os.path.join(os.getcwd(), out_dir))
+    os.makedirs(out_dir, exist_ok=True)
+    tiles_csv = os.path.join(out_dir, "qc_tiles.csv")
+    groups_csv = os.path.join(out_dir, "qc_groups.csv")
+    report_txt = os.path.join(out_dir, "qc_report.txt")
 
     # Save console report
     # (simple: re-run output not captured; so we just write summary + worst tiles)

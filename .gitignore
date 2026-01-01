@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+ENV/
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Data (do not commit large/raw data)
+data/
+
+# Common large raster/array outputs
+*.tif
+*.tiff
+*.vrt
+*.aux.xml
+*.ovr
+*.npy
+*.npz
+
+# Tool outputs / reports
+tools/qc_out/
+tools/quality_reports/
