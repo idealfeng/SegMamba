@@ -67,8 +67,18 @@ def _find_era5_files(era5_dir: Path, region_prefix: str, y0: str, y1: str):
     # expects names like:
     #   Tibetan_ERA5L_T2mC_native_2010_2011_181d.tif
     #   Tibetan_ERA5L_PrcpMM_native_2010_2011_181d.tif
-    temp = era5_dir / f"{region_prefix}_ERA5L_T2mC_native_{y0}_{y1}_181d.tif"
-    prcp = era5_dir / f"{region_prefix}_ERA5L_PrcpMM_native_{y0}_{y1}_181d.tif"
+    temp_name = f"{region_prefix}_ERA5L_T2mC_native_{y0}_{y1}_181d.tif"
+    prcp_name = f"{region_prefix}_ERA5L_PrcpMM_native_{y0}_{y1}_181d.tif"
+
+    temp = era5_dir / temp_name
+    prcp = era5_dir / prcp_name
+
+    # If ERA5 exports are stored in subfolders, locate them recursively.
+    if not temp.exists():
+        temp = _find_unique(era5_dir, temp_name) or temp
+    if not prcp.exists():
+        prcp = _find_unique(era5_dir, prcp_name) or prcp
+
     return temp, prcp
 
 
@@ -125,14 +135,29 @@ def _resolve_root_from_repo(repo_root: Path, rel: str) -> Path:
     # so the script works whether called from repo root or from tools/.
     return (Path.cwd() / p).resolve()
 
+def _find_unique(base_dir: Path, pattern: str) -> Path | None:
+    matches = sorted(base_dir.rglob(pattern))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple matches for pattern={pattern} under {base_dir}: {matches[:5]}"
+        )
+    return matches[0]
+
 
 def _infer_region_prefix(era5_dir: Path) -> str:
-    files = sorted(era5_dir.glob("*.tif"))
-    for f in files:
+    # Allow ERA5 exports to live in subfolders.
+    files = list(era5_dir.rglob("*.tif")) + list(era5_dir.rglob("*.tiff"))
+    for f in sorted(files):
         m = ERA5_PREFIX_RE.match(f.name)
         if m:
             return m.group("prefix")
-    raise RuntimeError(f"Cannot infer region_prefix from tif names under: {era5_dir}")
+    raise RuntimeError(
+        "Cannot infer region_prefix from tif names under: "
+        f"{era5_dir} (found {len(files)} tif/tiff). "
+        "Pass --region_prefix explicitly, or point --era5_dir to the folder that contains the ERA5 *.tif files."
+    )
 
 
 def main() -> int:

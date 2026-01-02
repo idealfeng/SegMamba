@@ -1,225 +1,313 @@
 import os
 import re
 import csv
-import glob
-import numpy as np
+import argparse
 from osgeo import gdal
+import numpy as np
+
+gdal.UseExceptions()
+
 """
-python filter_patches_no_overlap.py --root ..\data\raw_data\QinghaiTibet --out ..\data\patch_index\patch_index_core_no_overlap.csv
+python filter_patches_no_overlap.py `
+--root_modis ..\data\raw_data\QinghaiTibet `
+--root_era5  ..\data\raw_data\QinghaiTibet_ERA5L\aligned_to_modis_tiles `
+--out        ..\data\patch_index\filter_patches_no_overlap.csv `
+--min_valid_ratio 0.10
 """
-# ===== Fixed layout you validated =====
-T = 181
-B_NDSI_1 = 1
-B_MASK_1 = 1 + T
-B_ELEV = 2 * T + 1  # band 363
-# ======================================
 
-
-def parse_group_and_offsets(path: str):
+def find_matching_era5(aligned_dir: str, modis_path: str, kind: str) -> str:
     """
-    name like:
-    Tibetan_SnowCover_2010_2011_6ch_fixed181_OFFICIAL-0000000000-0000002560.tif
-    offsets are (yoff, xoff) in pixels
+    kind: 'temp' or 'prcp'
+    We try multiple suffix patterns, prefer ALIGN2 > ALIGN.
     """
-    base = os.path.basename(path)
-    group_id = base.split("-")[0]
-    m = re.search(r"-(\d{10})-(\d{10})\.tif$", base)
-    yoff = int(m.group(1)) if m else 0
-    xoff = int(m.group(2)) if m else 0
-    return group_id, yoff, xoff
+    base = os.path.basename(modis_path)
+    base_noext = os.path.splitext(base)[0]
 
-
-def integral_image(a: np.ndarray) -> np.ndarray:
-    # (H,W) -> (H+1,W+1)
-    return (
-        np.pad(a, ((1, 0), (1, 0)), mode="constant", constant_values=0)
-        .cumsum(0)
-        .cumsum(1)
-    )
-
-
-def rect_sum(ii: np.ndarray, x0: int, y0: int, w: int, h: int) -> float:
-    y1 = y0 + h
-    x1 = x0 + w
-    return ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
-
-
-def main(
-    root,
-    out_csv,
-    patch=256,
-    min_valid_ratio=0.10,
-    max_elev_void_ratio=0.05,
-    max_elev0_ratio=0.001,
-):
-    gdal.UseExceptions()
-
-    tifs = sorted(glob.glob(os.path.join(root, "*.tif")))
-    if not tifs:
-        raise SystemExit(f"[ERROR] No tif found in: {root}")
-
-    rows = []
-    total_candidates = 0
-    total_kept = 0
-
-    print("============================================================")
-    print("[FILTER] No-overlap patch filtering")
-    print(f"  root={root}")
-    print(f"  patch={patch}  stride={patch} (no overlap)")
-    print(
-        f"  rules: valid_ratio>={min_valid_ratio}, elev_void<={max_elev_void_ratio}, elev0<={max_elev0_ratio}"
-    )
-    print("============================================================")
-
-    for tif in tifs:
-        ds = gdal.Open(tif, gdal.GA_ReadOnly)
-        if ds is None:
-            raise SystemExit(f"[ERROR] Cannot open: {tif}")
-
-        group_id, tile_yoff, tile_xoff = parse_group_and_offsets(tif)
-        W, H = ds.RasterXSize, ds.RasterYSize
-
-        # enumerate full windows only
-        nx = (W - patch) // patch + 1 if W >= patch else 0
-        ny = (H - patch) // patch + 1 if H >= patch else 0
-        n_candidates_tile = nx * ny
-        total_candidates += n_candidates_tile
-
-        # 1) validDays per pixel = sum_t (MASK==1)
-        validDays = np.zeros((H, W), dtype=np.uint16)
-        for d in range(T):
-            m = ds.GetRasterBand(B_MASK_1 + d).ReadAsArray()
-            validDays += m == 1
-
-        # 2) static elev
-        elev = ds.GetRasterBand(B_ELEV).ReadAsArray().astype(np.int16)
-
-        # 3) integral images for fast patch stats
-        ii_v = integral_image(validDays.astype(np.uint32))
-        ii_vd = integral_image((elev == -9999).astype(np.uint8))
-        ii_v0 = integral_image((elev == 0).astype(np.uint8))
-
-        kept_tile = 0
-
-        for iy in range(ny):
-            y0 = iy * patch
-            for ix in range(nx):
-                x0 = ix * patch
-                area = patch * patch
-
-                v_sum = rect_sum(
-                    ii_v, x0, y0, patch, patch
-                )  # sum(validDays) over pixels
-                v_mean = v_sum / area
-                valid_ratio = v_mean / T
-
-                elev_void_ratio = rect_sum(ii_vd, x0, y0, patch, patch) / area
-                elev0_ratio = rect_sum(ii_v0, x0, y0, patch, patch) / area
-
-                # ===== Core rules =====
-                if valid_ratio < min_valid_ratio:
-                    continue
-                if elev_void_ratio > max_elev_void_ratio:
-                    continue
-                if elev0_ratio > max_elev0_ratio:
-                    continue
-                # ======================
-
-                # global coords (in pixel grid of the stitched group)
-                gx0 = tile_xoff + x0
-                gy0 = tile_yoff + y0
-
-                patch_id = f"{group_id}-y{gy0:06d}-x{gx0:06d}"
-
-                rows.append(
-                    {
-                        "patch_id": patch_id,
-                        "group_id": group_id,
-                        "tif_path": tif,
-                        "tile_xoff": tile_xoff,
-                        "tile_yoff": tile_yoff,
-                        "x0": x0,
-                        "y0": y0,
-                        "global_x0": gx0,
-                        "global_y0": gy0,
-                        "validDays_mean": float(v_mean),
-                        "valid_ratio": float(valid_ratio),
-                        "r255_est": float(1.0 - valid_ratio),
-                        "static_elev_ratio_eq_-9999": float(elev_void_ratio),
-                        "static_elev_ratio_eq_0": float(elev0_ratio),
-                    }
-                )
-                kept_tile += 1
-
-        total_kept += kept_tile
-
-        print(os.path.basename(tif))
-        print(
-            f"  size={W}x{H}  candidates={n_candidates_tile}  kept={kept_tile}  keep_rate={kept_tile/max(n_candidates_tile,1):.3f}"
-        )
-        ds = None
-
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-
-    # write CSV
-    if rows:
-        fieldnames = list(rows[0].keys())
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            w.writerows(rows)
-    else:
-        # still write header to be explicit
-        fieldnames = [
-            "patch_id",
-            "group_id",
-            "tif_path",
-            "tile_xoff",
-            "tile_yoff",
-            "x0",
-            "y0",
-            "global_x0",
-            "global_y0",
-            "validDays_mean",
-            "valid_ratio",
-            "r255_est",
-            "static_elev_ratio_eq_-9999",
-            "static_elev_ratio_eq_0",
+    if kind == "temp":
+        candidates = [
+            f"{base_noext}.ERA5T2mC.ALIGN2.vrt",
+            f"{base_noext}.ERA5T2mC.ALIGN2.tif",
+            f"{base_noext}.ERA5T2mC.ALIGN.vrt",
+            f"{base_noext}.ERA5T2mC.ALIGN.tif",
         ]
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
+    else:
+        candidates = [
+            f"{base_noext}.ERA5PrcpMM.ALIGN2.vrt",
+            f"{base_noext}.ERA5PrcpMM.ALIGN2.tif",
+            f"{base_noext}.ERA5PrcpMM.ALIGN.vrt",
+            f"{base_noext}.ERA5PrcpMM.ALIGN.tif",
+        ]
 
-    print("------------------------------------------------------------")
-    print(
-        f"[SUMMARY] candidates={total_candidates}  kept={total_kept}  keep_rate={total_kept/max(total_candidates,1):.3f}"
+    for name in candidates:
+        p = os.path.join(aligned_dir, name)
+        if os.path.exists(p):
+            return p
+
+    # fallback: fuzzy match (in case group_id changed a bit)
+    patt = re.escape(base_noext) + (
+        r"\.ERA5T2mC\..*?\.(vrt|tif)$"
+        if kind == "temp"
+        else r"\.ERA5PrcpMM\..*?\.(vrt|tif)$"
     )
-    print(f"[OUTPUT ] {out_csv}")
-    print("============================================================")
+    for fn in os.listdir(aligned_dir):
+        if re.match(patt, fn):
+            return os.path.join(aligned_dir, fn)
+
+    return ""
 
 
-if __name__ == "__main__":
-    import argparse
+def read_window(ds: gdal.Dataset, band_list, xoff, yoff, w, h) -> np.ndarray:
+    # GDAL band_list is 1-based
+    arr = ds.ReadAsArray(xoff, yoff, w, h, band_list=band_list)
+    if arr is None:
+        raise RuntimeError("ReadAsArray returned None")
+    return arr
 
+
+def nodata_mask(arr: np.ndarray, nodata_value=None) -> np.ndarray:
+    # ERA5 float data: nodata is often -9999; be robust:
+    if nodata_value is not None:
+        return arr == nodata_value
+    return arr <= -9000.0
+
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", required=True, help=r"..\data\raw_data\QinghaiTibet")
     ap.add_argument(
-        "--out",
+        "--root_modis",
         required=True,
-        help=r"..\data\patch_index\patch_index_core_no_overlap.csv",
+        help="MODIS 6ch dir, e.g. ..\\data\\raw_data\\QinghaiTibet",
     )
+    ap.add_argument(
+        "--root_era5",
+        required=True,
+        help="ERA5 aligned dir, e.g. ..\\data\\raw_data\\QinghaiTibet_ERA5L\\aligned_to_modis_tiles",
+    )
+    ap.add_argument("--out", required=True, help="Output patch index CSV path")
     ap.add_argument("--patch", type=int, default=256)
-
+    ap.add_argument("--stride", type=int, default=256)  # no overlap default
     ap.add_argument("--min_valid_ratio", type=float, default=0.10)
     ap.add_argument("--max_elev_void_ratio", type=float, default=0.05)
     ap.add_argument("--max_elev0_ratio", type=float, default=0.001)
 
+    # optional strict ERA5 invasion threshold (set negative to disable)
+    ap.add_argument("--max_era5_invasion", type=float, default=-1.0)
+
+    # sample bands for ERA5 stats (1-based)
+    ap.add_argument("--sample_bands", type=str, default="1,91,181")
+
     args = ap.parse_args()
-    main(
-        root=args.root,
-        out_csv=args.out,
-        patch=args.patch,
-        min_valid_ratio=args.min_valid_ratio,
-        max_elev_void_ratio=args.max_elev_void_ratio,
-        max_elev0_ratio=args.max_elev0_ratio,
+
+    patch = args.patch
+    stride = args.stride
+    sample_bands = [int(x.strip()) for x in args.sample_bands.split(",") if x.strip()]
+
+    # MODIS band layout (1-based):
+    # 1..181 NDSI, 182..362 MASK, 363 Elev, 364 Slope_x100, 365 North_x10000, 366 NDVI_x10000
+    MASK_BANDS = list(range(182, 363))
+    ELEV_BAND = 363
+
+    # For day k in [1..181], MASK band index = 181 + k
+    def mask_band_for_day(k1: int) -> int:
+        return 181 + k1
+
+    # gather MODIS tifs
+    modis_tifs = []
+    for root, _, files in os.walk(args.root_modis):
+        for fn in files:
+            if fn.lower().endswith(".tif") and "OFFICIAL" in fn and ".ALIGN" not in fn:
+                modis_tifs.append(os.path.join(root, fn))
+    modis_tifs.sort()
+
+    if not modis_tifs:
+        raise RuntimeError(f"No MODIS OFFICIAL tif found under {args.root_modis}")
+
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    header = [
+        "modis_path",
+        "era5_temp_path",
+        "era5_prcp_path",
+        "group_id",
+        "xoff",
+        "yoff",
+        "patch",
+        "stride",
+        "valid_ratio",
+        "elev_void_ratio",
+        "elev0_ratio",
+        "temp_nodata_ratio_sample",
+        "prcp_nodata_ratio_sample",
+        "temp_invasion_ratio_sample",
+        "prcp_invasion_ratio_sample",
+        "keep_reason",
+    ]
+
+    total_candidates = 0
+    total_kept = 0
+
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(header)
+
+        for modis_path in modis_tifs:
+            base_noext = os.path.splitext(os.path.basename(modis_path))[0]
+            group_id = (
+                base_noext  # keep simple; your existing scripts use filename-based ids
+            )
+
+            era5_temp = find_matching_era5(args.root_era5, modis_path, "temp")
+            era5_prcp = find_matching_era5(args.root_era5, modis_path, "prcp")
+
+            if not era5_temp or not era5_prcp:
+                print(f"[SKIP] missing ERA5 match for: {modis_path}")
+                continue
+
+            ds_m = gdal.Open(modis_path, gdal.GA_ReadOnly)
+            ds_t = gdal.Open(era5_temp, gdal.GA_ReadOnly)
+            ds_p = gdal.Open(era5_prcp, gdal.GA_ReadOnly)
+
+            w = ds_m.RasterXSize
+            h = ds_m.RasterYSize
+
+            # quick sanity on ERA5 band count
+            if ds_t.RasterCount != 181 or ds_p.RasterCount != 181:
+                print(
+                    f"[WARN] ERA5 band count !=181: {era5_temp}({ds_t.RasterCount}), {era5_prcp}({ds_p.RasterCount})"
+                )
+
+            nx = (w - patch) // stride + 1 if w >= patch else 0
+            ny = (h - patch) // stride + 1 if h >= patch else 0
+            candidates = nx * ny
+            kept = 0
+
+            for iy in range(ny):
+                yoff = iy * stride
+                for ix in range(nx):
+                    xoff = ix * stride
+                    total_candidates += 1
+
+                    # 1) valid_ratio from MASK (181 bands)
+                    mask_cube = read_window(
+                        ds_m, MASK_BANDS, xoff, yoff, patch, patch
+                    )  # (181, H, W)
+                    valid_ratio = float((mask_cube == 1).mean())
+
+                    # 2) elevation ratios
+                    elev = read_window(ds_m, [ELEV_BAND], xoff, yoff, patch, patch)
+                    if elev.ndim == 3:
+                        elev = elev[0]
+                    elev_void_ratio = float((elev == -9999).mean())
+                    elev0_ratio = float((elev == 0).mean())
+
+                    # 3) ERA5 sample nodata + invasion (sample days only)
+                    temp_nodata_ratio = 0.0
+                    prcp_nodata_ratio = 0.0
+                    temp_invasion_ratio = 0.0
+                    prcp_invasion_ratio = 0.0
+
+                    for k in sample_bands:
+                        if k < 1 or k > 181:
+                            continue
+                        tb = read_window(ds_t, [k], xoff, yoff, patch, patch)
+                        pb = read_window(ds_p, [k], xoff, yoff, patch, patch)
+                        if tb.ndim == 3:
+                            tb = tb[0]
+                        if pb.ndim == 3:
+                            pb = pb[0]
+
+                        # era5 nodata
+                        tmask = nodata_mask(tb)
+                        pmask = nodata_mask(pb)
+
+                        temp_nodata_ratio += float(tmask.mean())
+                        prcp_nodata_ratio += float(pmask.mean())
+
+                        # modis valid area for this day
+                        mb = mask_band_for_day(k)
+                        mday = read_window(ds_m, [mb], xoff, yoff, patch, patch)
+                        if mday.ndim == 3:
+                            mday = mday[0]
+                        valid_area = mday == 1
+                        denom = int(valid_area.sum())
+                        if denom > 0:
+                            temp_invasion_ratio += float(
+                                (tmask & valid_area).sum() / denom
+                            )
+                            prcp_invasion_ratio += float(
+                                (pmask & valid_area).sum() / denom
+                            )
+                        else:
+                            # if no valid pixels that day, invasion not meaningful; treat as 0
+                            temp_invasion_ratio += 0.0
+                            prcp_invasion_ratio += 0.0
+
+                    denom_days = max(1, len([k for k in sample_bands if 1 <= k <= 181]))
+                    temp_nodata_ratio /= denom_days
+                    prcp_nodata_ratio /= denom_days
+                    temp_invasion_ratio /= denom_days
+                    prcp_invasion_ratio /= denom_days
+
+                    # 4) filtering rules
+                    keep = True
+                    reason = "PASS"
+
+                    if valid_ratio < args.min_valid_ratio:
+                        keep = False
+                        reason = f"FAIL_valid_ratio<{args.min_valid_ratio}"
+                    elif elev_void_ratio > args.max_elev_void_ratio:
+                        keep = False
+                        reason = f"FAIL_elev_void>{args.max_elev_void_ratio}"
+                    elif elev0_ratio > args.max_elev0_ratio:
+                        keep = False
+                        reason = f"FAIL_elev0>{args.max_elev0_ratio}"
+
+                    if keep and args.max_era5_invasion >= 0.0:
+                        max_inv = max(temp_invasion_ratio, prcp_invasion_ratio)
+                        if max_inv > args.max_era5_invasion:
+                            keep = False
+                            reason = f"FAIL_era5_invasion>{args.max_era5_invasion}"
+
+                    if keep:
+                        kept += 1
+                        total_kept += 1
+
+                        wr.writerow(
+                            [
+                                modis_path,
+                                era5_temp,
+                                era5_prcp,
+                                group_id,
+                                xoff,
+                                yoff,
+                                patch,
+                                stride,
+                                f"{valid_ratio:.6f}",
+                                f"{elev_void_ratio:.6f}",
+                                f"{elev0_ratio:.6f}",
+                                f"{temp_nodata_ratio:.6f}",
+                                f"{prcp_nodata_ratio:.6f}",
+                                f"{temp_invasion_ratio:.6f}",
+                                f"{prcp_invasion_ratio:.6f}",
+                                reason,
+                            ]
+                        )
+
+            print(f"{os.path.basename(modis_path)}")
+            print(
+                f"  size={w}x{h}  candidates={candidates}  kept={kept}  keep_rate={(kept/max(1,candidates)):.3f}"
+            )
+
+            ds_m = None
+            ds_t = None
+            ds_p = None
+
+    print("------------------------------------------------------------")
+    print(
+        f"[SUMMARY] candidates={total_candidates}  kept={total_kept}  keep_rate={(total_kept/max(1,total_candidates)):.3f}"
     )
+    print(f"[OUTPUT ] {args.out}")
+
+
+if __name__ == "__main__":
+    main()
